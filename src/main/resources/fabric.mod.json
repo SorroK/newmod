@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "rustrender",
+  "version": "${version}",
+  "name": "RustRender",
+  "description": "A native Rust optimisation core for the client rendering path, with a pure-Java fallback.",
+  "authors": [
+    "SorroK"
+  ],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.tntpvp.rustrender.RustRenderClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.20.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

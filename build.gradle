@@ -1,0 +1,163 @@
+plugins {
+    id 'fabric-loom' version '1.14-SNAPSHOT'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+// ---------------------------------------------------------------------------
+// Rust native core
+// ---------------------------------------------------------------------------
+// The Rust crate is compiled as a cdylib and packaged under
+// natives/<os>-<arch>/ inside the mod jar. Fabric has no native-library DSL,
+// so this is plain Gradle + cargo. Only the host target is built locally; a
+// release build needs a CI matrix for the other platforms.
+def nativeDir = file("native")
+def cargoBinary = System.getenv("CARGO") ?: "${System.getProperty('user.home')}/.cargo/bin/cargo"
+
+def hostPlatform = {
+    String os = System.getProperty("os.name").toLowerCase(Locale.ROOT)
+    String arch = System.getProperty("os.arch").toLowerCase(Locale.ROOT)
+    String osName = os.contains("win") ? "windows" : os.contains("mac") ? "macos" : "linux"
+    String archName = (arch == "aarch64" || arch == "arm64") ? "arm64" : "x64"
+    return "${osName}-${archName}"
+}
+
+def nativeLibName = {
+    String os = System.getProperty("os.name").toLowerCase(Locale.ROOT)
+    return os.contains("win") ? "rustrender_core.dll" : os.contains("mac") ? "librustrender_core.dylib" : "librustrender_core.so"
+}
+
+// --- Windows cross-compilation ---------------------------------------------
+// A jar built on Linux contains only the Linux binary, so Windows players
+// would silently get the Java fallback. The mingw-w64 toolchain (installed by
+// scripts/install-mingw.sh) lets the same build emit the PE DLL as well. If it
+// is absent the task is skipped rather than failing the build: the jar simply
+// ships fewer platforms and the Java fallback covers the rest.
+def windowsTriple = 'x86_64-pc-windows-gnu'
+def windowsLinker = System.getenv('CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER')
+        ?: "${System.getProperty('user.home')}/tools/mingw/usr/bin/x86_64-w64-mingw32-gcc"
+
+tasks.register('cargoBuild', Exec) {
+    group = 'rust'
+    description = 'Compiles the Rust renderer core for the host platform.'
+    workingDir = nativeDir
+    commandLine cargoBinary, 'build', '--release', '--locked'
+    environment 'CARGO_TARGET_DIR', new File(nativeDir, 'target').absolutePath
+    inputs.dir new File(nativeDir, 'src')
+    inputs.file new File(nativeDir, 'Cargo.toml')
+    inputs.file new File(nativeDir, 'Cargo.lock')
+    outputs.dir new File(nativeDir, "target/release")
+}
+
+tasks.register('cargoBuildWindows', Exec) {
+    group = 'rust'
+    description = 'Cross-compiles the core for 64-bit Windows (PE DLL).'
+    onlyIf { new File(windowsLinker).canExecute() }
+    workingDir = nativeDir
+    commandLine cargoBinary, 'build', '--release', '--locked', '--target', windowsTriple
+    environment 'CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER', windowsLinker
+    environment 'CARGO_TARGET_DIR', new File(nativeDir, 'target').absolutePath
+    // Static CRT: the DLL must import nothing but system libraries, because the
+    // game will not ship libgcc_s_seh-1.dll or libstdc++-6.dll for us.
+    environment 'RUSTFLAGS', '-C target-feature=+crt-static'
+    inputs.dir new File(nativeDir, 'src')
+    inputs.file new File(nativeDir, 'Cargo.toml')
+    inputs.file new File(nativeDir, 'Cargo.lock')
+    outputs.dir new File(nativeDir, "target/${windowsTriple}/release")
+}
+
+// Every platform the jar is able to carry. Cross targets only end up in the
+// jar when they were actually built, which keeps the build honest: no
+// directory appears without a matching binary inside it.
+def nativeCandidates = [
+        'linux-x64'  : ['target/x86_64-unknown-linux-gnu/release/librustrender_core.so'],
+        'linux-arm64': ['target/aarch64-unknown-linux-gnu/release/librustrender_core.so'],
+        'windows-x64': ["target/${windowsTriple}/release/rustrender_core.dll"],
+        'macos-x64'  : ['target/x86_64-apple-darwin/release/librustrender_core.dylib'],
+        'macos-arm64': ['target/aarch64-apple-darwin/release/librustrender_core.dylib'],
+]
+// The host build lands in target/release under its bare name.
+nativeCandidates[hostPlatform()] = ["target/release/${nativeLibName()}"]
+
+processResources {
+    dependsOn 'cargoBuild', 'cargoBuildWindows'
+
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+
+    // Resolved at execution time, after the cargo tasks have run.
+    nativeCandidates.each { platform, paths ->
+        paths.each { relative ->
+            from(new File(nativeDir, relative).parent) {
+                include new File(relative).name
+                into "natives/${platform}"
+            }
+        }
+    }
+
+    doFirst {
+        def present = nativeCandidates.findAll { platform, paths ->
+            paths.any { new File(nativeDir, it).isFile() }
+        }.keySet().sort()
+        logger.lifecycle("Bundling native cores: ${present.join(', ')}")
+        if (!present.contains('windows-x64')) {
+            logger.warn("No Windows DLL bundled; run scripts/install-mingw.sh to cross-compile one.")
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = "UTF-8"
+    it.options.release = 21
+}
+
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+// The test source set holds standalone harnesses (parityCheck, benchmark) run
+// through JavaExec, not JUnit tests, so `build` must not require discoveries.
+tasks.named('test') {
+    failOnNoDiscoveredTests = false
+}
+
+// Dev-only harnesses: correctness parity against the Java reference
+// implementation and a timing comparison. Not part of the shipped jar.
+tasks.register('parityCheck', JavaExec) {
+    group = 'verification'
+    description = 'Verifies the Rust culler matches the Java reference implementation.'
+    dependsOn 'testClasses', 'cargoBuild'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.tntpvp.rustrender.bench.ParityCheck'
+    systemProperty 'rustrender.native.dir', new File(nativeDir, "target/release").absolutePath
+}
+
+tasks.register('benchmark', JavaExec) {
+    group = 'verification'
+    description = 'Times the Rust culler against the Java reference implementation.'
+    dependsOn 'testClasses', 'cargoBuild'
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'com.tntpvp.rustrender.bench.CullerBenchmark'
+    systemProperty 'rustrender.native.dir', new File(nativeDir, "target/release").absolutePath
+}
